@@ -21,3 +21,16 @@ Thumbs.db
 # IDE
 .vscode/*
 !.vscode/extensions.json
+/src/generated/prisma
+
+node_modules/
+.env
+.env.*
+!.env.example
+
+dev.db
+dev.db-journal
+
+.agents/
+.claude/
+.windsurf/

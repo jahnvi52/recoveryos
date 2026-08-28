@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model RecoveryOpportunity {
+  id                String   @id @default(cuid())
+
+  customerName      String
+  customerEmail     String?
+  customerContact   String?
+
+  amount            Int
+  currency          String   @default("INR")
+
+  originalPaymentId String?
+
+  failureReason     String?
+
+  recoveryProbability Float?
+
+  recommendedAction String?
+
+  status            String   @default("AT_RISK")
+
+  paymentLinkId     String?
+  paymentLinkUrl    String?
+
+  razorpayPaymentId String?
+  webhookEventId    String?   @unique
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  recoveredAt       DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+}

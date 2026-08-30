@@ -8,35 +8,90 @@ datasource db {
 }
 
 model RecoveryOpportunity {
-  id                String   @id @default(cuid())
+  id String @id @default(cuid())
 
-  customerName      String
-  customerEmail     String?
-  customerContact   String?
+  customerName    String
+  customerEmail   String?
+  customerContact String?
 
-  amount            Int
-  currency          String   @default("INR")
+  amount   Int
+  currency String @default("INR")
 
   originalPaymentId String?
-
   failureReason     String?
 
   recoveryProbability Float?
+  recommendedAction   String?
 
-  recommendedAction String?
+  priority         String?
+  urgency          String?
+  recoveryStrategy String?
 
-  status            String   @default("AT_RISK")
+  status String @default("AT_RISK")
 
-  paymentLinkId     String?
-  paymentLinkUrl    String?
+  paymentLinkId  String?
+  paymentLinkUrl String?
 
   razorpayPaymentId String?
-  webhookEventId    String?   @unique
+  webhookEventId    String? @unique
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
-  recoveredAt       DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  recoveredAt DateTime?
+
+  auditEvents RecoveryAuditEvent[]
+  evaluations RecoveryEvaluation[]
 
   @@index([status])
+  @@index([createdAt])
+  @@index([priority])
+  @@index([urgency])
+}
+
+model RecoveryAuditEvent {
+  id String @id @default(cuid())
+
+  opportunityId String
+
+  eventType     String
+  action        String?
+  executionMode String?
+  reason        String?
+
+  expectedAmount Int?
+  actualAmount   Int?
+
+  metadata String?
+
+  createdAt DateTime @default(now())
+
+  opportunity RecoveryOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  @@index([opportunityId])
+  @@index([createdAt])
+  @@index([eventType])
+}
+
+model RecoveryEvaluation {
+  id String @id @default(cuid())
+
+  opportunityId String
+  batchId       String
+
+  predictedRecoveryAmount Int
+  actualRecoveryAmount    Int @default(0)
+
+  recoveryProbability Float
+
+  outcome         String
+  predictionError Int
+
+  createdAt DateTime @default(now())
+
+  opportunity RecoveryOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  @@index([opportunityId])
+  @@index([batchId])
+  @@index([outcome])
   @@index([createdAt])
 }

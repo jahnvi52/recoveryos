@@ -8,9 +8,7 @@ export type GuardrailDecision =
 
 export type GuardrailResult = {
   decision: GuardrailDecision;
-
   allowed: boolean;
-
   reason: string;
 
   checks: {
@@ -20,21 +18,43 @@ export type GuardrailResult = {
   }[];
 
   attemptCount: number;
-
   maxAttempts: number;
 };
 
+/*
+ * IMPORTANT
+ * ---------------------------------------------------------
+ * RecoveryOS stores money in PAISE.
+ *
+ * ₹1 = 100 paise
+ *
+ * Therefore:
+ *
+ * ₹500       = 50,000 paise
+ * ₹1,00,000  = 10,000,000 paise
+ * ---------------------------------------------------------
+ */
+
 const MIN_RECOVERY_PROBABILITY = 60;
 
-const MIN_EXPECTED_RECOVERY = 500;
+/*
+ * ₹500 minimum expected recovery.
+ */
+const MIN_EXPECTED_RECOVERY = 50_000;
 
-const HUMAN_APPROVAL_AMOUNT = 100000;
+/*
+ * ₹1,00,000 human approval threshold.
+ */
+const HUMAN_APPROVAL_AMOUNT = 10_000_000;
 
+/*
+ * Maximum number of recovery execution attempts.
+ */
 const MAX_ATTEMPTS = 2;
 
 export async function evaluateRecoveryGuardrails(
   opportunityId: string
-) {
+): Promise<GuardrailResult> {
   const opportunity =
     await prisma.recoveryOpportunity.findUnique({
       where: {
@@ -68,8 +88,7 @@ export async function evaluateRecoveryGuardrails(
       },
     });
 
-  const attemptCount =
-    attemptEvents;
+  const attemptCount = attemptEvents;
 
   /*
    * -------------------------------------------------------
@@ -80,6 +99,9 @@ export async function evaluateRecoveryGuardrails(
   const recoveryProbability =
     opportunity.recoveryProbability ?? 0;
 
+  /*
+   * Amount is stored in paise.
+   */
   const expectedRecoveryAmount =
     Math.round(
       opportunity.amount *
@@ -106,16 +128,13 @@ export async function evaluateRecoveryGuardrails(
     opportunity.status !== "RECOVERED";
 
   checks.push({
-    name:
-      "Recovery still open",
+    name: "Recovery still open",
 
-    passed:
-      recoveryStillOpen,
+    passed: recoveryStillOpen,
 
-    reason:
-      recoveryStillOpen
-        ? "The opportunity is still eligible for recovery."
-        : "The opportunity has already been recovered.",
+    reason: recoveryStillOpen
+      ? "The opportunity is still eligible for recovery."
+      : "The opportunity has already been recovered.",
   });
 
   /*
@@ -126,16 +145,13 @@ export async function evaluateRecoveryGuardrails(
     attemptCount < MAX_ATTEMPTS;
 
   checks.push({
-    name:
-      "Maximum recovery attempts",
+    name: "Maximum recovery attempts",
 
-    passed:
-      attemptsAvailable,
+    passed: attemptsAvailable,
 
-    reason:
-      attemptsAvailable
-        ? `${attemptCount} of ${MAX_ATTEMPTS} recovery attempts used.`
-        : `Maximum of ${MAX_ATTEMPTS} recovery attempts has been reached.`,
+    reason: attemptsAvailable
+      ? `${attemptCount} of ${MAX_ATTEMPTS} recovery attempts used.`
+      : `Maximum of ${MAX_ATTEMPTS} recovery attempts has been reached.`,
   });
 
   /*
@@ -161,6 +177,8 @@ export async function evaluateRecoveryGuardrails(
 
   /*
    * 4. MINIMUM EXPECTED RECOVERY
+   *
+   * ₹500 = 50,000 paise.
    */
 
   const expectedValuePassed =
@@ -176,16 +194,16 @@ export async function evaluateRecoveryGuardrails(
 
     reason:
       expectedValuePassed
-        ? `₹${expectedRecoveryAmount.toLocaleString(
+        ? `₹${(
+            expectedRecoveryAmount / 100
+          ).toLocaleString(
             "en-IN"
-          )} expected recovery clears the ₹${MIN_EXPECTED_RECOVERY.toLocaleString(
+          )} expected recovery clears the ₹500 minimum.`
+        : `₹${(
+            expectedRecoveryAmount / 100
+          ).toLocaleString(
             "en-IN"
-          )} minimum.`
-        : `₹${expectedRecoveryAmount.toLocaleString(
-            "en-IN"
-          )} expected recovery is below the ₹${MIN_EXPECTED_RECOVERY.toLocaleString(
-            "en-IN"
-          )} minimum.`,
+          )} expected recovery is below the ₹500 minimum.`,
   });
 
   /*
@@ -202,8 +220,12 @@ export async function evaluateRecoveryGuardrails(
     name:
       "Duplicate payment-link protection",
 
-    passed:
-      true,
+    /*
+     * This check is informational.
+     *
+     * Existing links are handled by the recovery route.
+     */
+    passed: true,
 
     reason:
       duplicateLinkProtected
@@ -219,8 +241,7 @@ export async function evaluateRecoveryGuardrails(
 
   if (!recoveryStillOpen) {
     return {
-      decision:
-        "STOP" as GuardrailDecision,
+      decision: "STOP",
 
       allowed: false,
 
@@ -238,8 +259,7 @@ export async function evaluateRecoveryGuardrails(
 
   if (!attemptsAvailable) {
     return {
-      decision:
-        "STOP" as GuardrailDecision,
+      decision: "STOP",
 
       allowed: false,
 
@@ -263,8 +283,7 @@ export async function evaluateRecoveryGuardrails(
 
   if (!probabilityPassed) {
     return {
-      decision:
-        "SUPPRESS" as GuardrailDecision,
+      decision: "SUPPRESS",
 
       allowed: false,
 
@@ -282,17 +301,16 @@ export async function evaluateRecoveryGuardrails(
 
   if (!expectedValuePassed) {
     return {
-      decision:
-        "SUPPRESS" as GuardrailDecision,
+      decision: "SUPPRESS",
 
       allowed: false,
 
       reason:
-        `Expected recovery of ₹${expectedRecoveryAmount.toLocaleString(
+        `Expected recovery of ₹${(
+          expectedRecoveryAmount / 100
+        ).toLocaleString(
           "en-IN"
-        )} is below the ₹${MIN_EXPECTED_RECOVERY.toLocaleString(
-          "en-IN"
-        )} minimum. RecoveryOS suppresses the opportunity.`,
+        )} is below the ₹500 minimum. RecoveryOS suppresses the opportunity.`,
 
       checks,
 
@@ -307,24 +325,32 @@ export async function evaluateRecoveryGuardrails(
    * -------------------------------------------------------
    * HUMAN APPROVAL
    * -------------------------------------------------------
+   *
+   * IMPORTANT:
+   *
+   * ₹1,00,000 = 10,000,000 paise.
+   *
+   * Any opportunity at or above this amount MUST NOT
+   * automatically create a recovery payment link.
    */
 
   if (
     opportunity.amount >=
     HUMAN_APPROVAL_AMOUNT
   ) {
+    const amountInRupees =
+      opportunity.amount / 100;
+
     return {
       decision:
-        "REQUIRE_HUMAN" as GuardrailDecision,
+        "REQUIRE_HUMAN",
 
       allowed: true,
 
       reason:
-        `Opportunity value of ₹${opportunity.amount.toLocaleString(
+        `Opportunity value of ₹${amountInRupees.toLocaleString(
           "en-IN"
-        )} exceeds the ₹${HUMAN_APPROVAL_AMOUNT.toLocaleString(
-          "en-IN"
-        )} human-approval threshold.`,
+        )} exceeds the ₹1,00,000 human-approval threshold. RecoveryOS pauses execution and requires human approval.`,
 
       checks,
 
@@ -343,7 +369,7 @@ export async function evaluateRecoveryGuardrails(
 
   return {
     decision:
-      "ALLOW_AUTO" as GuardrailDecision,
+      "ALLOW_AUTO",
 
     allowed: true,
 

@@ -77,18 +77,18 @@ const DEFAULT_GUARDRAILS: RecoveryGuardrails = {
    * Avoid spending operational effort on extremely
    * small expected-value opportunities.
    */
-  minExpectedRecoveryAmount: 500,
+  minExpectedRecoveryAmount: 50_000,
 
   /*
    * High-value recoveries receive human oversight.
    */
-  humanApprovalAmount: 100000,
+  humanApprovalAmount: 10_000_000,
 
   /*
    * Automatic execution is capped independently from
    * the human-approval threshold.
    */
-  autoExecuteMaxAmount: 100000,
+  autoExecuteMaxAmount: 10_000_000,
 };
 
 function clamp(
@@ -205,7 +205,7 @@ function buildCandidates(
         decision.urgency
       ) * 20;
 
-    if (expectedValue >= 25000) {
+    if (expectedValue >= 50_000) {
       score += 10;
     }
 
@@ -299,7 +299,7 @@ function buildCandidates(
    * ----------------------------------------------------
    */
 
-  if (amount >= 100000) {
+  if (amount >= 10_000_000) {
     candidates.push({
       action: "ESCALATE_HUMAN",
       score:
@@ -327,7 +327,7 @@ function buildCandidates(
 
   if (
     probability < 60 ||
-    expectedValue < 500
+    expectedValue < 50_000
   ) {
     candidates.push({
       action: "SUPPRESS",

@@ -611,10 +611,402 @@ router.post(
         error
       );
 
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
       return res.status(500).json({
         success: false,
-        error:
-          "Failed to execute agent decision",
+        error: message || "Unknown agent execution error",
+      });
+    }
+  }
+);
+
+
+/**
+ * POST /api/agent/opportunities/:id/approve
+ *
+ * Human approval endpoint.
+ *
+ * This route is intentionally separate from the autonomous
+ * execution route. It can execute only when the most recent
+ * audit event proves that RecoveryOS previously requested
+ * human approval for this opportunity.
+ */
+router.post(
+  "/opportunities/:id/approve",
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const opportunity =
+        await prisma.recoveryOpportunity.findUnique({
+          where: { id },
+        });
+
+      if (!opportunity) {
+        return res.status(404).json({
+          success: false,
+          error: "Recovery opportunity not found",
+        });
+      }
+
+      if (opportunity.status === "RECOVERED") {
+        return res.status(400).json({
+          success: false,
+          error: "This recovery opportunity has already been recovered",
+        });
+      }
+
+      /*
+       * Verify that the opportunity is actually waiting
+       * for human approval.
+       */
+      const latestAuditEvents =
+        await prisma.recoveryAuditEvent.findMany({
+          where: {
+            opportunityId: opportunity.id,
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 20,
+        });
+
+      const latestApprovalRequest =
+        latestAuditEvents.find(
+          (event) =>
+            event.eventType === "APPROVAL_REQUIRED"
+        );
+
+      const latestEvent =
+        latestAuditEvents[0];
+
+      if (
+        !latestApprovalRequest ||
+        !latestEvent ||
+        latestEvent.eventType !== "APPROVAL_REQUIRED"
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This opportunity is not currently waiting for human approval.",
+        });
+      }
+
+      /*
+       * Re-run the deterministic AI decision so the
+       * approved action is captured in the execution audit.
+       *
+       * Human approval bypasses the automatic threshold
+       * decision, but it does NOT bypass opportunity state
+       * or duplicate-link protection.
+       */
+      const decision =
+        analyzeRecovery({
+          amount: opportunity.amount,
+          failureReason: opportunity.failureReason,
+          customer: {
+            name: opportunity.customerName,
+            email:
+              opportunity.customerEmail ??
+              undefined,
+            contact:
+              opportunity.customerContact ??
+              undefined,
+          },
+        });
+
+      const agentDecision =
+        decideRecoveryAction({
+          amount: opportunity.amount,
+          status: opportunity.status,
+          paymentLinkExists: Boolean(
+            opportunity.paymentLinkId &&
+              opportunity.paymentLinkUrl
+          ),
+          decision,
+        });
+
+      await recordRecoveryAuditEvent({
+        opportunityId: opportunity.id,
+        eventType: "APPROVED",
+        action: agentDecision.nextBestAction,
+        executionMode: "HUMAN_APPROVED",
+        reason:
+          "Human reviewer approved the RecoveryOS recommendation after the high-value guardrail required approval.",
+        expectedAmount:
+          agentDecision.expectedRecoveryAmount,
+        metadata: {
+          approvedBy:
+            req.body?.approvedBy ||
+            "human_reviewer",
+          approvalRequestReason:
+            latestApprovalRequest.reason,
+        },
+      });
+
+      /*
+       * Never create a duplicate recovery payment link.
+       */
+      if (
+        opportunity.paymentLinkId &&
+        opportunity.paymentLinkUrl
+      ) {
+        await recordRecoveryAuditEvent({
+          opportunityId: opportunity.id,
+          eventType: "EXECUTION_SKIPPED",
+          action: agentDecision.nextBestAction,
+          executionMode: "HUMAN_APPROVED",
+          reason:
+            "Human approval was recorded, but an existing recovery payment link is already available. RecoveryOS reused the existing link.",
+          expectedAmount:
+            agentDecision.expectedRecoveryAmount,
+        });
+
+        return res.json({
+          success: true,
+          approved: true,
+          executed: false,
+          reusedExistingLink: true,
+          message:
+            "Human approval recorded. Existing recovery payment link will be reused.",
+          agentDecision,
+          paymentLink: {
+            id: opportunity.paymentLinkId,
+            shortUrl: opportunity.paymentLinkUrl,
+          },
+        });
+      }
+
+      /*
+       * ACTUAL RAZORPAY EXECUTION AFTER HUMAN APPROVAL
+       */
+      const result =
+        await createPaymentLink({
+          amount: opportunity.amount,
+          customer: {
+            name: opportunity.customerName,
+            email:
+              opportunity.customerEmail ??
+              undefined,
+            contact:
+              opportunity.customerContact ??
+              undefined,
+          },
+          description:
+            "RecoveryOS human-approved recovery",
+          referenceId:
+            `HUMAN-APPROVED-${opportunity.id}`,
+          originalPaymentId:
+            opportunity.originalPaymentId ??
+            undefined,
+          failureReason:
+            decision.diagnosis,
+          recoveryProbability:
+            decision.recoveryProbability,
+          recommendedAction:
+            decision.recommendedAction,
+        });
+
+      /*
+       * Move payment-link data onto the original
+       * recovery opportunity.
+       */
+      await prisma.recoveryOpportunity.delete({
+        where: {
+          id: result.recoveryOpportunity.id,
+        },
+      });
+
+      const updatedOpportunity =
+        await prisma.recoveryOpportunity.update({
+          where: {
+            id: opportunity.id,
+          },
+          data: {
+            failureReason:
+              decision.diagnosis,
+            recoveryProbability:
+              decision.recoveryProbability,
+            recommendedAction:
+              decision.recommendedAction,
+            priority:
+              decision.priority,
+            urgency:
+              decision.urgency,
+            recoveryStrategy:
+              decision.recoveryStrategy,
+            status:
+              "RECOVERY_INITIATED",
+            paymentLinkId:
+              result.paymentLink.id,
+            paymentLinkUrl:
+              result.paymentLink.short_url,
+            updatedAt:
+              new Date(),
+          },
+        });
+
+      await recordRecoveryAuditEvent({
+        opportunityId: opportunity.id,
+        eventType: "EXECUTED",
+        action: agentDecision.nextBestAction,
+        executionMode: "HUMAN_APPROVED",
+        reason:
+          "RecoveryOS executed the recovery action after explicit human approval.",
+        expectedAmount:
+          agentDecision.expectedRecoveryAmount,
+        metadata: {
+          paymentLinkId:
+            result.paymentLink.id,
+          paymentLinkUrl:
+            result.paymentLink.short_url,
+          approvedBy:
+            req.body?.approvedBy ||
+            "human_reviewer",
+          amount:
+            opportunity.amount,
+          updatedOpportunityId:
+            updatedOpportunity.id,
+        },
+      });
+
+      return res.json({
+        success: true,
+        approved: true,
+        executed: true,
+        executionMode: "HUMAN_APPROVED",
+        message:
+          "Human approval accepted and recovery action executed successfully.",
+        agentDecision,
+        recoveryOpportunity: {
+          id: updatedOpportunity.id,
+          status: updatedOpportunity.status,
+          priority: updatedOpportunity.priority,
+          urgency: updatedOpportunity.urgency,
+          recoveryStrategy:
+            updatedOpportunity.recoveryStrategy,
+        },
+        paymentLink: {
+          id: result.paymentLink.id,
+          shortUrl:
+            result.paymentLink.short_url,
+          amount:
+            result.paymentLink.amount,
+          currency:
+            result.paymentLink.currency,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "Human-approved recovery failed:",
+        error
+      );
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      return res.status(500).json({
+        success: false,
+        error: message || "Unknown human-approved recovery error",
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/agent/opportunities/:id/reject
+ *
+ * Records a human rejection and permanently blocks
+ * the currently pending approval request.
+ */
+router.post(
+  "/opportunities/:id/reject",
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const opportunity =
+        await prisma.recoveryOpportunity.findUnique({
+          where: { id },
+        });
+
+      if (!opportunity) {
+        return res.status(404).json({
+          success: false,
+          error: "Recovery opportunity not found",
+        });
+      }
+
+      const latestAuditEvents =
+        await prisma.recoveryAuditEvent.findMany({
+          where: {
+            opportunityId: opportunity.id,
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 20,
+        });
+
+      const latestEvent =
+        latestAuditEvents[0];
+
+      if (
+        !latestEvent ||
+        latestEvent.eventType !==
+          "APPROVAL_REQUIRED"
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This opportunity is not currently waiting for human approval.",
+        });
+      }
+
+      await recordRecoveryAuditEvent({
+        opportunityId: opportunity.id,
+        eventType: "REJECTED",
+        action: "REJECT",
+        executionMode: "HUMAN_REVIEW",
+        reason:
+          req.body?.reason ||
+          "Human reviewer rejected the recovery action.",
+        expectedAmount:
+          opportunity.amount,
+        metadata: {
+          rejectedBy:
+            req.body?.rejectedBy ||
+            "human_reviewer",
+        },
+      });
+
+      return res.json({
+        success: true,
+        rejected: true,
+        executed: false,
+        message:
+          "Recovery action rejected by human reviewer.",
+      });
+    } catch (error) {
+      console.error(
+        "Human rejection failed:",
+        error
+      );
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      return res.status(500).json({
+        success: false,
+        error: message || "Unknown rejection error",
       });
     }
   }
@@ -624,300 +1016,85 @@ router.post(
 /**
  * GET /api/agent/approvals
  *
- * Returns opportunities whose latest audit event is
- * APPROVAL_REQUIRED. This is the human-in-the-loop queue.
+ * Returns only opportunities whose latest audit event is
+ * APPROVAL_REQUIRED. This keeps the Human Approval Center
+ * synchronized with the actual agent state.
  */
-router.get("/approvals", async (_req, res) => {
-  try {
-    const opportunities = await prisma.recoveryOpportunity.findMany({
-      where: {
-        status: {
-          not: "RECOVERED",
-        },
-      },
-      orderBy: {
-        updatedAt: "desc",
-      },
-    });
+router.get(
+  "/approvals",
+  async (_req, res) => {
+    try {
+      const opportunities =
+        await prisma.recoveryOpportunity.findMany({
+          where: {
+            status: {
+              not: "RECOVERED",
+            },
+          },
+          orderBy: {
+            amount: "desc",
+          },
+        });
 
-    const pending = [];
+      const auditEvents =
+        await prisma.recoveryAuditEvent.findMany({
+          orderBy: {
+            createdAt: "desc",
+          },
+        });
 
-    for (const opportunity of opportunities) {
-      const latestAudit = await prisma.recoveryAuditEvent.findFirst({
-        where: {
-          opportunityId: opportunity.id,
-        },
-        orderBy: {
-          createdAt: "desc",
-        },
-      });
+      const latestEventByOpportunity =
+        new Map<string, (typeof auditEvents)[number]>();
 
-      if (latestAudit?.eventType === "APPROVAL_REQUIRED") {
-        pending.push(opportunity);
+      for (const event of auditEvents) {
+        if (
+          !latestEventByOpportunity.has(
+            event.opportunityId
+          )
+        ) {
+          latestEventByOpportunity.set(
+            event.opportunityId,
+            event
+          );
+        }
       }
-    }
 
-    return res.json({
-      success: true,
-      approvals: pending,
-    });
-  } catch (error) {
-    console.error("Failed to fetch approval queue:", error);
+      const pendingApprovals =
+        opportunities.filter((opportunity) => {
+          const latestEvent =
+            latestEventByOpportunity.get(
+              opportunity.id
+            );
 
-    return res.status(500).json({
-      success: false,
-      error: "Failed to fetch approval queue",
-    });
-  }
-});
-
-/**
- * POST /api/agent/opportunities/:id/approve
- *
- * Explicit human authorization. This is the only path that can
- * bypass the high-value REQUIRE_HUMAN decision, and only after
- * an APPROVAL_REQUIRED audit event exists.
- */
-router.post("/opportunities/:id/approve", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const opportunity = await prisma.recoveryOpportunity.findUnique({
-      where: { id },
-    });
-
-    if (!opportunity) {
-      return res.status(404).json({
-        success: false,
-        error: "Recovery opportunity not found",
-      });
-    }
-
-    if (opportunity.status === "RECOVERED") {
-      return res.status(409).json({
-        success: false,
-        error: "Opportunity has already been recovered",
-      });
-    }
-
-    const latestAudit = await prisma.recoveryAuditEvent.findFirst({
-      where: {
-        opportunityId: id,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
-    });
-
-    if (latestAudit?.eventType !== "APPROVAL_REQUIRED") {
-      return res.status(409).json({
-        success: false,
-        error: "This opportunity does not have a pending human approval request",
-      });
-    }
-
-    const decision = analyzeRecovery({
-      amount: opportunity.amount,
-      failureReason: opportunity.failureReason,
-      customer: {
-        name: opportunity.customerName,
-        email: opportunity.customerEmail ?? undefined,
-        contact: opportunity.customerContact ?? undefined,
-      },
-    });
-
-    const agentDecision = decideRecoveryAction({
-      amount: opportunity.amount,
-      status: opportunity.status,
-      paymentLinkExists: Boolean(
-        opportunity.paymentLinkId && opportunity.paymentLinkUrl
-      ),
-      decision,
-    });
-
-    await recordRecoveryAuditEvent({
-      opportunityId: id,
-      eventType: "APPROVED",
-      action: agentDecision.nextBestAction,
-      executionMode: "HUMAN_APPROVED",
-      reason: "Human operator approved the bounded recovery action.",
-      expectedAmount: agentDecision.expectedRecoveryAmount,
-      metadata: {
-        approvedBy: "human_operator",
-        previousEvent: "APPROVAL_REQUIRED",
-      },
-    });
-
-    if (opportunity.paymentLinkId && opportunity.paymentLinkUrl) {
-      await recordRecoveryAuditEvent({
-        opportunityId: id,
-        eventType: "EXECUTION_SKIPPED",
-        action: agentDecision.nextBestAction,
-        executionMode: "HUMAN_APPROVED",
-        reason: "An existing recovery payment link is already available; duplicate creation was prevented.",
-        expectedAmount: agentDecision.expectedRecoveryAmount,
-      });
+          return (
+            latestEvent?.eventType ===
+            "APPROVAL_REQUIRED"
+          );
+        });
 
       return res.json({
         success: true,
-        executed: false,
-        reusedExistingLink: true,
-        executionMode: "HUMAN_APPROVED",
-        message: "Existing recovery payment link will be reused.",
-        paymentLink: {
-          id: opportunity.paymentLinkId,
-          shortUrl: opportunity.paymentLinkUrl,
-        },
+        count: pendingApprovals.length,
+        opportunities: pendingApprovals,
       });
-    }
+    } catch (error) {
+      console.error(
+        "Failed to fetch pending approvals:",
+        error
+      );
 
-    const result = await createPaymentLink({
-      amount: opportunity.amount,
-      customer: {
-        name: opportunity.customerName,
-        email: opportunity.customerEmail ?? undefined,
-        contact: opportunity.customerContact ?? undefined,
-      },
-      description: "RecoveryOS human-approved recovery",
-      referenceId: `AGENT-HUMAN-${opportunity.id}`,
-      originalPaymentId: opportunity.originalPaymentId ?? undefined,
-      failureReason: decision.diagnosis,
-      recoveryProbability: decision.recoveryProbability,
-      recommendedAction: decision.recommendedAction,
-    });
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
 
-    await prisma.recoveryOpportunity.delete({
-      where: {
-        id: result.recoveryOpportunity.id,
-      },
-    });
-
-    const updatedOpportunity = await prisma.recoveryOpportunity.update({
-      where: { id },
-      data: {
-        failureReason: decision.diagnosis,
-        recoveryProbability: decision.recoveryProbability,
-        recommendedAction: decision.recommendedAction,
-        priority: decision.priority,
-        urgency: decision.urgency,
-        recoveryStrategy: decision.recoveryStrategy,
-        status: "RECOVERY_INITIATED",
-        paymentLinkId: result.paymentLink.id,
-        paymentLinkUrl: result.paymentLink.short_url,
-        updatedAt: new Date(),
-      },
-    });
-
-    await recordRecoveryAuditEvent({
-      opportunityId: id,
-      eventType: "EXECUTED",
-      action: agentDecision.nextBestAction,
-      executionMode: "HUMAN_APPROVED",
-      reason: "Human approval granted and the recovery action was executed.",
-      expectedAmount: agentDecision.expectedRecoveryAmount,
-      metadata: {
-        paymentLinkId: result.paymentLink.id,
-        paymentLinkUrl: result.paymentLink.short_url,
-        approvedBy: "human_operator",
-      },
-    });
-
-    return res.json({
-      success: true,
-      executed: true,
-      executionMode: "HUMAN_APPROVED",
-      message: "Human-approved recovery action executed successfully.",
-      agentDecision,
-      recoveryOpportunity: {
-        id: updatedOpportunity.id,
-        status: updatedOpportunity.status,
-        priority: updatedOpportunity.priority,
-        urgency: updatedOpportunity.urgency,
-        recoveryStrategy: updatedOpportunity.recoveryStrategy,
-      },
-      paymentLink: {
-        id: result.paymentLink.id,
-        shortUrl: result.paymentLink.short_url,
-        amount: result.paymentLink.amount,
-        currency: result.paymentLink.currency,
-      },
-    });
-  } catch (error) {
-    console.error("Failed to approve recovery:", error);
-
-    return res.status(500).json({
-      success: false,
-      error: "Failed to approve recovery",
-    });
-  }
-});
-
-/**
- * POST /api/agent/opportunities/:id/reject
- */
-router.post("/opportunities/:id/reject", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const opportunity = await prisma.recoveryOpportunity.findUnique({
-      where: { id },
-    });
-
-    if (!opportunity) {
-      return res.status(404).json({
+      return res.status(500).json({
         success: false,
-        error: "Recovery opportunity not found",
+        error: message || "Unknown approval-fetch error",
       });
     }
-
-    const latestAudit = await prisma.recoveryAuditEvent.findFirst({
-      where: {
-        opportunityId: id,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
-    });
-
-    if (latestAudit?.eventType !== "APPROVAL_REQUIRED") {
-      return res.status(409).json({
-        success: false,
-        error: "This opportunity does not have a pending human approval request",
-      });
-    }
-
-    await recordRecoveryAuditEvent({
-      opportunityId: id,
-      eventType: "REJECTED",
-      action: opportunity.recommendedAction ?? "RECOVERY",
-      executionMode: "HUMAN_REJECTED",
-      reason: "Human operator rejected the recovery action.",
-      expectedAmount:
-        opportunity.recoveryProbability != null
-          ? Math.round(
-              opportunity.amount *
-                (opportunity.recoveryProbability / 100)
-            )
-          : undefined,
-      metadata: {
-        rejectedBy: "human_operator",
-      },
-    });
-
-    return res.json({
-      success: true,
-      rejected: true,
-      message: "Recovery action rejected. No payment link was created.",
-    });
-  } catch (error) {
-    console.error("Failed to reject recovery:", error);
-
-    return res.status(500).json({
-      success: false,
-      error: "Failed to reject recovery",
-    });
   }
-});
+);
 
 /**
  * POST /api/agent/batch/evaluate
@@ -1004,10 +1181,14 @@ router.post(
         error
       );
 
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
       return res.status(500).json({
         success: false,
-        error:
-          "Failed to evaluate recovery batch",
+        error: message || "Unknown batch evaluation error",
       });
     }
   }
